@@ -1,13 +1,11 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
 
 from .routers import users, aulas, uploads
 from . import models
 from .database import engine
-import os
 
 app = FastAPI(title="GAS Informar - API")
 
@@ -50,12 +48,6 @@ def ensure_aula_publicada_column():
 
 ensure_aula_publicada_column()
 
-# Ensure static/upload dir exists (para armazenar imagens)
-UPLOAD_DIR = "static/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# monta static (serve /static/...)
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Inclui os routers da aplicação (ordem não crítica)
 app.include_router(users.router)
