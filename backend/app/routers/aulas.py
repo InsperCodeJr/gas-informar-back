@@ -22,29 +22,23 @@ def require_role(user: models.User, allowed_roles: List[str]):
 # helper: verificar se usuário pode ver a aula
 def user_can_view_aula(user: models.User, aula: models.Aula) -> bool:
     """
-    Regras:
-    - admin / professor sempre True
-    - se aula.category é None -> pública
-    - se user.turma == aula.category -> True
-    - se user estiver em aula.permitidos -> True (override)
-    - caso contrário False
+    Regras de visibilidade:
+    - admin / professor sempre podem acessar, inclusive rascunhos;
+    - alunos nunca veem aulas em revisão (publicada=False);
+    - aula publicada sem categoria é pública;
+    - aula publicada com categoria exige que user.turma corresponda.
     """
     if user.role in ("admin", "professor"):
         return True
 
-    # pública
+    if not bool(getattr(aula, "publicada", True)):
+        return False
+
     if getattr(aula, "category", None) in (None, "", "null"):
         return True
 
-    # match turma
     if getattr(user, "turma", None) and getattr(aula, "category", None):
-        if str(user.turma).strip().lower() == str(aula.category).strip().lower():
-            return True
-
-    # override: associação explicitamente permitida
-    if getattr(aula, "permitidos", None):
-        if any(u.id == user.id for u in aula.permitidos):
-            return True
+        return str(user.turma).strip().lower() == str(aula.category).strip().lower()
 
     return False
 
@@ -163,16 +157,36 @@ def finalizar_tentativa(aula_id: int, db: Session = Depends(auth.get_db), curren
     aula = db.query(models.Aula).filter(models.Aula.id == aula_id).first()
     if not aula:
         raise HTTPException(status_code=404, detail="Aula não encontrada")
+    if not user_can_view_aula(current_user, aula):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permissão negada")
 
-    # buscar respostas do aluno para exercícios dessa aula
+    # Se a tentativa mais recente já foi finalizada, não cria uma conclusão duplicada.
+    ultima_tentativa = (
+        db.query(models.TentativaAula)
+        .filter(
+            models.TentativaAula.aula_id == aula_id,
+            models.TentativaAula.aluno_id == current_user.id,
+        )
+        .order_by(models.TentativaAula.created_at.desc())
+        .first()
+    )
+    if ultima_tentativa and ultima_tentativa.finalizada:
+        return {"status": "finalizada", "pontuacao": ultima_tentativa.pontuacao or 0}
+
+    # Considera apenas a resposta mais recente de cada exercício para evitar
+    # pontuação duplicada quando houve reenvio antes da finalização.
     respostas = (
         db.query(models.RespostaAluno)
         .join(models.Exercicio, models.RespostaAluno.exercicio_id == models.Exercicio.id)
         .filter(models.Exercicio.aula_id == aula_id, models.RespostaAluno.aluno_id == current_user.id)
+        .order_by(models.RespostaAluno.enviado_em.desc(), models.RespostaAluno.id.desc())
         .all()
     )
-
-    total = sum((r.pontuacao or 0) for r in respostas)
+    respostas_recentes = {}
+    for resposta in respostas:
+        if resposta.exercicio_id not in respostas_recentes:
+            respostas_recentes[resposta.exercicio_id] = resposta
+    total = sum((r.pontuacao or 0) for r in respostas_recentes.values())
 
     # procurar tentativa existente NÃO finalizada (se houver) ou criar nova
     tentativa = (
@@ -180,7 +194,7 @@ def finalizar_tentativa(aula_id: int, db: Session = Depends(auth.get_db), curren
         .filter(
             models.TentativaAula.aula_id == aula_id,
             models.TentativaAula.aluno_id == current_user.id,
-            models.TentativaAula.finalizada == False,  # apenas não-finalizadas
+            models.TentativaAula.finalizada == False,
         )
         .order_by(models.TentativaAula.created_at.desc())
         .first()
@@ -217,106 +231,101 @@ def finalizar_tentativa(aula_id: int, db: Session = Depends(auth.get_db), curren
 # ---------------
 @router.get("/{aula_id}/desempenho")
 def desempenho_aula_geral(aula_id: int, db: Session = Depends(auth.get_db), current_user: models.User = Depends(auth.get_current_user)):
-    """
-    Retorna métricas agregadas da aula:
-    {
-      aula_id,
-      titulo,
-      respondentes,
-      media_pontuacao,
-      percentual_conclusao,  # ver nota abaixo
-      questoes: [
-        {
-          exercicio_id,
-          enunciado,
-          total_respondentes,
-          total_acertos,
-          taxa_acerto,            # percentual (0-100)
-          distribuicao_respostas: { "<alternativa_id_or_label>": count, ... } OR null
-        },
-        ...
-      ]
-    }
+    """Métricas agregadas e resumo por aluno para professores/admins."""
+    require_role(current_user, ["admin", "professor"])
 
-    Nota sobre percentual_conclusao:
-    - Não há informação de "turma" / "alunos matriculados" no schema fornecido.
-    - Aqui definimos percentual_conclusao como: (número de tentativas finalizadas) / (número de tentativas existentes) * 100
-      onde "tentativas existentes" significa alunos que possuem alguma RespostaAluno para esta aula.
-    - Se preferir outro denominador (ex.: total de alunos de uma turma), ajuste a lógica.
-    """
-    # permissões: apenas professores/admins podem ver agregados (ou aluno pode ver a própria via outro endpoint)
-    if current_user.role not in ("admin", "professor"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permissão negada")
-
-    aula = db.query(models.Aula).options(joinedload(models.Aula.exercicios)).filter(models.Aula.id == aula_id).first()
+    aula = (
+        db.query(models.Aula)
+        .options(joinedload(models.Aula.exercicios))
+        .filter(models.Aula.id == aula_id)
+        .first()
+    )
     if not aula:
         raise HTTPException(status_code=404, detail="Aula não encontrada")
 
-    # 1) respondentes / média de pontuação: usar TentativaAula finalizada
-    tentativas = db.query(models.TentativaAula).filter(models.TentativaAula.aula_id == aula_id).all()
-    # respondentes = quantidade de tentativas finalizadas (cada tentativa representa um aluno finalizou)
-    respondentes = sum(1 for t in tentativas if bool(t.finalizada))
-    # média pontuação sobre tentativas finalizadas (se nenhuma, 0)
-    pontuacoes = [t.pontuacao for t in tentativas if t.finalizada and t.pontuacao is not None]
-    media_pontuacao = (sum(pontuacoes) / len(pontuacoes)) if pontuacoes else 0.0
+    exercicios = list(aula.exercicios or [])
+    total_questoes = len(exercicios)
+    pontuacao_maxima = float(sum((ex.pontos or 0) for ex in exercicios))
 
-    # 2) percentual_conclusao: aqui usamos (finalizadas / alunos que deram alguma resposta)
-    # buscar alunos que têm ao menos uma resposta nesta aula
-    alunos_com_resposta = (
-        db.query(models.RespostaAluno.aluno_id)
-        .join(models.Exercicio, models.RespostaAluno.exercicio_id == models.Exercicio.id)
-        .filter(models.Exercicio.aula_id == aula_id)
-        .distinct()
+    # Alunos elegíveis: todas as turmas para aula pública; turma correspondente
+    # quando a aula é direcionada a Python/WebDev.
+    alunos_q = db.query(models.User).filter(models.User.role == "aluno")
+    if getattr(aula, "category", None) not in (None, "", "null"):
+        alunos_q = alunos_q.filter(func.lower(models.User.turma) == str(aula.category).strip().lower())
+    alunos = alunos_q.order_by(models.User.nome.asc()).all()
+    aluno_ids = {u.id for u in alunos}
+
+    tentativas = (
+        db.query(models.TentativaAula)
+        .filter(models.TentativaAula.aula_id == aula_id)
+        .order_by(models.TentativaAula.created_at.desc())
         .all()
     )
-    total_alunos_com_resposta = len(alunos_com_resposta)
-    percentual_conclusao = (respondentes / total_alunos_com_resposta * 100) if total_alunos_com_resposta > 0 else 0.0
+    # Uma linha por aluno: manter a tentativa mais recente.
+    tentativa_por_aluno = {}
+    for t in tentativas:
+        if t.aluno_id not in tentativa_por_aluno:
+            tentativa_por_aluno[t.aluno_id] = t
 
-    # 3) para cada exercício: computar totais e distribuição
+    respostas_todas = (
+        db.query(models.RespostaAluno)
+        .join(models.Exercicio, models.RespostaAluno.exercicio_id == models.Exercicio.id)
+        .filter(models.Exercicio.aula_id == aula_id)
+        .order_by(models.RespostaAluno.enviado_em.desc(), models.RespostaAluno.id.desc())
+        .all()
+    )
+
+    # Evita contar múltiplos envios do mesmo aluno para a mesma questão.
+    resposta_mais_recente = {}
+    for r in respostas_todas:
+        key = (r.aluno_id, r.exercicio_id)
+        if key not in resposta_mais_recente:
+            resposta_mais_recente[key] = r
+
+    iniciaram_ids = {aluno_id for aluno_id, _ in resposta_mais_recente.keys()}
+    finalizados_ids = {
+        aluno_id for aluno_id, t in tentativa_por_aluno.items()
+        if bool(t.finalizada)
+    }
+
+    # Para aulas públicas, métricas de turma usam todos os alunos cadastrados.
+    # Caso uma aula tenha sido recategorizada depois de respostas existentes, não
+    # misturamos alunos fora da turma atual no denominador da conclusão.
+    total_alunos = len(alunos)
+    iniciaram = len(iniciaram_ids & aluno_ids)
+    concluidos = len(finalizados_ids & aluno_ids)
+    percentual_conclusao = (concluidos / total_alunos * 100) if total_alunos else 0.0
+
+    pontuacoes_finalizadas = []
+    for aluno_id in (finalizados_ids & aluno_ids):
+        t = tentativa_por_aluno.get(aluno_id)
+        if t and t.pontuacao is not None:
+            pontuacoes_finalizadas.append(float(t.pontuacao))
+    media_pontuacao = (sum(pontuacoes_finalizadas) / len(pontuacoes_finalizadas)) if pontuacoes_finalizadas else 0.0
+    media_percentual = (media_pontuacao / pontuacao_maxima * 100) if pontuacao_maxima > 0 else 0.0
+
     questoes_data = []
-    for ex in (aula.exercicios or []):
-        # respostas relacionadas a esse exercício
-        respostas_ex = (
-            db.query(models.RespostaAluno)
-            .filter(models.RespostaAluno.exercicio_id == ex.id)
-            .all()
-        )
-
-        total_respondentes_ex = len({r.aluno_id for r in respostas_ex})  # distinct alunos que responderam
+    for ex in exercicios:
+        respostas_ex = [
+            r for (aluno_id, exercicio_id), r in resposta_mais_recente.items()
+            if exercicio_id == ex.id and aluno_id in aluno_ids
+        ]
+        total_respondentes_ex = len(respostas_ex)
         total_acertos_ex = sum(1 for r in respostas_ex if (r.pontuacao or 0) > 0)
-
-        taxa_acerto = (total_acertos_ex / total_respondentes_ex * 100) if total_respondentes_ex > 0 else 0.0
+        taxa_acerto = (total_acertos_ex / total_respondentes_ex * 100) if total_respondentes_ex else 0.0
 
         distribuicao = None
-        # tentar montar distribuição: se exercício tem alternativas JSONB, contamos por alternativa_id
-        try:
-            alterns = ex.alternativas or []  # array JSONB com itens {id, texto, is_correta}
-            if alterns and isinstance(alterns, list):
-                # contar ocorrências por alternativa_id entre respostas_ex
-                counts = {}
-                for r in respostas_ex:
-                    key = str(r.alternativa_id) if r.alternativa_id is not None else "__texto__:" + (r.resposta_texto or "")
-                    counts[key] = counts.get(key, 0) + 1
-                # mapar keys para algo legível (usar id -> texto quando possível)
-                human = {}
-                alt_map = { str(a.get("id")): a.get("texto") or f"Alt {a.get('id')}" for a in alterns }
-                for k, v in counts.items():
-                    if k.startswith("__texto__:"):
-                        label = k.replace("__texto__:", "") or "texto"
-                    else:
-                        label = alt_map.get(k, f"Alt {k}")
-                    human[label] = v
-                distribuicao = human
-            else:
-                # não há alternativas estruturadas: agrupar por resposta_texto
-                counts = {}
-                for r in respostas_ex:
-                    txt = (r.resposta_texto or "").strip() or f"alt:{r.alternativa_id}"
-                    counts[txt] = counts.get(txt, 0) + 1
-                distribuicao = counts if counts else None
-        except Exception as e:
-            # segurança: se algo falhar, deixamos distribuicao como None
-            distribuicao = None
+        if respostas_ex:
+            counts = {}
+            alterns = ex.alternativas or []
+            alt_map = {str(a.get("id")): a.get("texto") or f"Alternativa {a.get('id')}" for a in alterns if isinstance(a, dict)}
+            for r in respostas_ex:
+                if r.alternativa_id is not None:
+                    label = alt_map.get(str(r.alternativa_id), f"Alternativa {r.alternativa_id}")
+                else:
+                    label = (r.resposta_texto or "Sem resposta").strip() or "Sem resposta"
+                counts[label] = counts.get(label, 0) + 1
+            distribuicao = counts or None
 
         questoes_data.append({
             "exercicio_id": ex.id,
@@ -324,19 +333,49 @@ def desempenho_aula_geral(aula_id: int, db: Session = Depends(auth.get_db), curr
             "total_respondentes": total_respondentes_ex,
             "total_acertos": total_acertos_ex,
             "taxa_acerto": round(taxa_acerto, 2),
-            "distribuicao_respostas": distribuicao
+            "distribuicao_respostas": distribuicao,
         })
 
-    response = {
+    alunos_data = []
+    for aluno in alunos:
+        respostas_aluno = [
+            r for (aluno_id, _), r in resposta_mais_recente.items() if aluno_id == aluno.id
+        ]
+        tentativa = tentativa_por_aluno.get(aluno.id)
+        finalizada = bool(tentativa.finalizada) if tentativa else False
+        pontuacao_atual = (
+            float(tentativa.pontuacao or 0)
+            if tentativa and tentativa.pontuacao is not None
+            else float(sum((r.pontuacao or 0) for r in respostas_aluno))
+        )
+        respostas_count = len(respostas_aluno)
+        alunos_data.append({
+            "aluno_id": aluno.id,
+            "nome": aluno.nome,
+            "username": aluno.username,
+            "turma": aluno.turma,
+            "finalizada": finalizada,
+            "pontuacao_total": round(pontuacao_atual, 2),
+            "percentual_nota": round((pontuacao_atual / pontuacao_maxima * 100) if pontuacao_maxima > 0 else 0.0, 2),
+            "respostas": respostas_count,
+            "total_questoes": total_questoes,
+            "percentual_questoes": round((respostas_count / total_questoes * 100) if total_questoes else 0.0, 2),
+        })
+
+    return {
         "aula_id": aula.id,
         "titulo": aula.titulo,
-        "respondentes": respondentes,
+        "category": getattr(aula, "category", None),
+        "pontuacao_maxima": round(pontuacao_maxima, 2),
+        "total_alunos": total_alunos,
+        "iniciaram": iniciaram,
+        "respondentes": concluidos,
         "media_pontuacao": round(media_pontuacao, 2),
+        "media_percentual": round(media_percentual, 2),
         "percentual_conclusao": round(percentual_conclusao, 2),
-        "questoes": questoes_data
+        "questoes": questoes_data,
+        "alunos": alunos_data,
     }
-
-    return response
 
 
 # -----------------------
@@ -351,6 +390,12 @@ def desempenho_aula_por_aluno(aula_id: int, aluno_id: int, db: Session = Depends
     aula = db.query(models.Aula).options(joinedload(models.Aula.exercicios)).filter(models.Aula.id == aula_id).first()
     if not aula:
         raise HTTPException(status_code=404, detail="Aula não encontrada")
+    if not user_can_view_aula(current_user, aula):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permissão negada")
+
+    aluno = db.query(models.User).filter(models.User.id == aluno_id, models.User.role == "aluno").first()
+    if not aluno:
+        raise HTTPException(status_code=404, detail="Aluno não encontrado")
 
     tentativa = (
         db.query(models.TentativaAula)
@@ -363,10 +408,14 @@ def desempenho_aula_por_aluno(aula_id: int, aluno_id: int, db: Session = Depends
         db.query(models.RespostaAluno)
         .join(models.Exercicio, models.RespostaAluno.exercicio_id == models.Exercicio.id)
         .filter(models.Exercicio.aula_id == aula_id, models.RespostaAluno.aluno_id == aluno_id)
+        .order_by(models.RespostaAluno.enviado_em.desc(), models.RespostaAluno.id.desc())
         .all()
     )
 
-    resp_map = {r.exercicio_id: r for r in respostas}
+    resp_map = {}
+    for r in respostas:
+        if r.exercicio_id not in resp_map:
+            resp_map[r.exercicio_id] = r
 
     results = []
     total_obtido = 0
@@ -391,6 +440,8 @@ def desempenho_aula_por_aluno(aula_id: int, aluno_id: int, db: Session = Depends
     response = {
         "aula_id": aula_id,
         "aluno_id": aluno_id,
+        "nome": aluno.nome,
+        "username": aluno.username,
         "pontuacao_total": tentativa.pontuacao if (tentativa and tentativa.pontuacao is not None) else total_obtido,
         "finalizada": bool(tentativa.finalizada) if tentativa else False,
         "responses": results,
@@ -433,9 +484,10 @@ def listar_aulas(
     if current_user.role in ("admin", "professor"):
         aulas = base_q.order_by(models.Aula.created_at.desc()).offset(skip).limit(limit).all()
     else:
-        # alunos: públicas OR categoria == user.turma (case-insensitive)
-        public_q = base_q.filter(models.Aula.category == None)
-        turma_q = base_q.filter(
+        # alunos: somente publicadas; depois aplica pública OU turma correspondente.
+        visible_q = base_q.filter(models.Aula.publicada == True)
+        public_q = visible_q.filter(models.Aula.category == None)
+        turma_q = visible_q.filter(
             models.Aula.category != None,
             func.lower(models.Aula.category) == func.lower(current_user.turma or "")
         )
@@ -461,6 +513,7 @@ def listar_aulas(
             exercicios=a.exercicios or [],
             created_at=a.created_at,
             category=getattr(a, "category", None),
+            publicada=bool(getattr(a, "publicada", True)),
         )
         result.append(aula_out)
 
@@ -501,6 +554,7 @@ def obter_aula(aula_id: int, db: Session = Depends(auth.get_db), current_user: m
         exercicios=aula.exercicios or [],
         created_at=aula.created_at,
         category=getattr(aula, "category", None),
+        publicada=bool(getattr(aula, "publicada", True)),
     )
     return aula_out
 
@@ -516,11 +570,9 @@ def criar_aula(payload: schemas.AulaCreate, db: Session = Depends(auth.get_db), 
         titulo=payload.titulo,
         descricao=payload.descricao,
         autor_id=current_user.id,
+        category=payload.category,
+        publicada=bool(payload.publicada),
     )
-
-    # aplicar categoria/turma da aula (pode ser None -> pública)
-    if getattr(payload, "category", None) is not None:
-        aula.category = payload.category
 
     db.add(aula)
     db.flush()  # garante aula.id
@@ -579,6 +631,7 @@ def criar_aula(payload: schemas.AulaCreate, db: Session = Depends(auth.get_db), 
         exercicios=aula.exercicios or [],
         created_at=aula.created_at,
         category=getattr(aula, "category", None),
+        publicada=bool(getattr(aula, "publicada", True)),
     )
     return aula_out
 
@@ -614,8 +667,9 @@ def atualizar_aula(
 
     # CATEGORY (nova lógica baseada em turmas)
     if "category" in fields_set:
-        # payload.category pode ser string ou None (null) -> aplica diretamente
         aula.category = payload.category
+    if "publicada" in fields_set and payload.publicada is not None:
+        aula.publicada = bool(payload.publicada)
 
     # BLOCOS
     if "blocos" in fields_set:
@@ -742,6 +796,7 @@ def atualizar_aula(
         exercicios=aula.exercicios or [],
         created_at=aula.created_at,
         category=getattr(aula, "category", None),
+        publicada=bool(getattr(aula, "publicada", True)),
     )
     return aula_out
 
@@ -802,6 +857,22 @@ def submeter_resposta(payload: schemas.RespostaCreate, db: Session = Depends(aut
     exercicio = db.query(models.Exercicio).filter(models.Exercicio.id == payload.exercicio_id).first()
     if not exercicio:
         raise HTTPException(status_code=404, detail="Exercício não encontrado")
+    aula = db.query(models.Aula).filter(models.Aula.id == exercicio.aula_id).first()
+    if not aula or not user_can_view_aula(current_user, aula):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permissão negada")
+
+    if current_user.role == "aluno":
+        tentativa_finalizada = (
+            db.query(models.TentativaAula)
+            .filter(
+                models.TentativaAula.aula_id == aula.id,
+                models.TentativaAula.aluno_id == current_user.id,
+                models.TentativaAula.finalizada == True,
+            )
+            .first()
+        )
+        if tentativa_finalizada:
+            raise HTTPException(status_code=400, detail="Esta tentativa já foi finalizada")
 
     pontuacao = 0
 

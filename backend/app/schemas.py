@@ -59,6 +59,7 @@ class TokenData(BaseModel):
 
 # ---------- aulas / conteúdo / exercícios ----------
 class ConteudoBlocoCreate(BaseModel):
+    id: Optional[int] = None
     titulo: Optional[str] = None
     texto: Optional[str] = None
     ordem: Optional[int] = None
@@ -98,10 +99,12 @@ class ExercicioOut(BaseModel):
     titulo: Optional[str] = None
     enunciado: str
     tipo: ExerciseType
+    resposta_modelo: Optional[str] = None
     pontos: int
-    alternativas: Optional[List[AlternativaInOut]] = []
-    correct_alternativas: Optional[List[int]] = []
-    feedback_professor: Optional[str] = None   # NOVO
+    ordem: Optional[int] = 0
+    alternativas: List[AlternativaInOut] = Field(default_factory=list)
+    correct_alternativas: List[int] = Field(default_factory=list)
+    feedback_professor: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -111,6 +114,7 @@ class AulaCreate(BaseModel):
     blocos: Optional[List[ConteudoBlocoCreate]] = None
     exercicios: Optional[List[ExercicioCreate]] = None
     category: Optional[str] = None
+    publicada: bool = False
 
 class AulaOut(BaseModel):
     id: int
@@ -122,6 +126,7 @@ class AulaOut(BaseModel):
     exercicios: List[ExercicioOut] = Field(default_factory=list)
     created_at: datetime
     category: Optional[str] = None
+    publicada: bool = True
     
     model_config = {"from_attributes": True}
 
@@ -131,8 +136,9 @@ class AulaUpdate(BaseModel):
     blocos: Optional[List[ConteudoBlocoCreate]] = None
     exercicios: Optional[List[ExercicioCreate]] = None
     category: Optional[str] = None
-    class Config:
-        orm_mode = True
+    publicada: Optional[bool] = None
+
+    model_config = {"from_attributes": True}
 
 # ---------- respostas ----------
 class RespostaCreate(BaseModel):
@@ -161,15 +167,33 @@ class QuestaoDesempenho(BaseModel):
     total_respondentes: int
     total_acertos: int
     taxa_acerto: float  # 0..100
-    distribuicao_respostas: Optional[Dict[int, int]] = None  # {alternativa_id: count}
+    distribuicao_respostas: Optional[Dict[str, int]] = None
+
+class AlunoResumoDesempenho(BaseModel):
+    aluno_id: int
+    nome: str
+    username: str
+    turma: Optional[str] = None
+    finalizada: bool
+    pontuacao_total: float
+    percentual_nota: float
+    respostas: int
+    total_questoes: int
+    percentual_questoes: float
 
 class AulaDesempenho(BaseModel):
     aula_id: int
     titulo: str
+    category: Optional[str] = None
+    pontuacao_maxima: float
+    total_alunos: int
+    iniciaram: int
     respondentes: int
     media_pontuacao: float
+    media_percentual: float
     percentual_conclusao: float  # 0..100
     questoes: List[QuestaoDesempenho] = Field(default_factory=list)
+    alunos: List[AlunoResumoDesempenho] = Field(default_factory=list)
 
 class DetalheAlunoResposta(BaseModel):
     exercicio_id: int

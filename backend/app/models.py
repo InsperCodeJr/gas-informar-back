@@ -34,6 +34,10 @@ class Aula(Base):
     autor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     category = Column(String(64), nullable=True, index=True) # category/turma (Python, WebDev)
+    # Aulas em revisão ficam visíveis somente para admins/professores.
+    # default=True preserva compatibilidade com bancos existentes; novas aulas
+    # criadas pelo frontend são enviadas explicitamente como rascunho.
+    publicada = Column(Boolean, nullable=False, default=True, index=True)
 
     autor = relationship("User", back_populates="aulas")
     blocos = relationship("ConteudoBloco", back_populates="aula", cascade="all, delete-orphan", order_by="ConteudoBloco.ordem")
